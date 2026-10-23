@@ -50,6 +50,9 @@ type TLB struct {
 	FlushedEntries uint64
 	Walks          uint64
 	WalksByPID     map[vm.PID]uint64
+	// FillsByPIDSet records successful translation fills by tenant and set.
+	// It supports hypervisor-side footprint measurements without a probe.
+	FillsByPIDSet map[vm.PID][]uint64
 
 	// RoundHook, when set, is called at the start of every tick. The live
 	// re-keying harness uses it to run probe rounds on simulated time while
@@ -280,6 +283,13 @@ func (tlb *TLB) parseBottom(now sim.VTimeInSec) bool {
 
 	setID := tlb.setIDFor(page.PID, page.VAddr)
 	set := tlb.Sets[setID]
+	if tlb.FillsByPIDSet == nil {
+		tlb.FillsByPIDSet = make(map[vm.PID][]uint64)
+	}
+	if tlb.FillsByPIDSet[page.PID] == nil {
+		tlb.FillsByPIDSet[page.PID] = make([]uint64, tlb.numSets)
+	}
+	tlb.FillsByPIDSet[page.PID][setID]++
 
 	wayID, resident := -1, false
 	if rs, ok := set.(internal.RegionSet); ok {
