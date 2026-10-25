@@ -39,7 +39,25 @@ type TLB struct {
 	EvictCrossPID uint64
 	log2RegionSize uint64
 	SubEntryFill   uint64
-	setKey uint64
+
+	// Keyed set mapping (keyed.go). defaultMap applies to every tenant
+	// without its own entry in pidMaps; nil means the published mapping.
+	defaultMap *setMap
+	pidMaps    map[vm.PID]*setMap
+
+	// Cost accounting for re-keying: entries dropped by flushes, and
+	// translations sent to the lower level (page walks), total and per PID.
+	FlushedEntries uint64
+	Walks          uint64
+	WalksByPID     map[vm.PID]uint64
+	// FillsByPIDSet records successful translation fills by tenant and set.
+	// It supports hypervisor-side footprint measurements without a probe.
+	FillsByPIDSet map[vm.PID][]uint64
+
+	// RoundHook, when set, is called at the start of every tick. The live
+	// re-keying harness uses it to run probe rounds on simulated time while
+	// the TLB is active, without keeping the engine alive on its own.
+	RoundHook func(now sim.VTimeInSec)
 }
 
 // Reset sets all the entries int he TLB to be invalid
@@ -58,6 +76,10 @@ func (tlb *TLB) reset() {
 // Tick defines how TLB update states at each cycle
 func (tlb *TLB) Tick(now sim.VTimeInSec) bool {
 	madeProgress := false
+
+	if tlb.RoundHook != nil {
+		tlb.RoundHook(now)
+	}
 
 	madeProgress = tlb.performCtrlReq(now) || madeProgress
 
@@ -120,7 +142,7 @@ func (tlb *TLB) lookup(now sim.VTimeInSec) bool {
 		return tlb.processTLBMSHRHit(now, mshrEntry, req)
 	}
 
-	setID := tlb.vAddrToSetID(req.VAddr)
+	setID := tlb.setIDFor(req.PID, req.VAddr)
 	set := tlb.Sets[setID]
 	wayID, page, found := set.Lookup(req.PID, req.VAddr)
 	if found && page.Valid {
@@ -171,31 +193,15 @@ func (tlb *TLB) handleTranslationMiss(
 }
 
 
-// vAddrToSetID maps a virtual address to a set index using the linear GF(2)
-// mapping reported for the reference platform: output bit r is the exclusive-or
-// of every eighth virtual-address bit starting at bit 20+r, over VA[46:20].
+// vAddrToSetID maps a virtual address to a set index under the TLB-wide
+// default mapping: the published GF(2) map over VA[46:20] (output bit r is
+// the XOR of every eighth bit from 20+r) unless Rekey installed a keyed one.
+// Per-tenant lookups go through setIDFor in keyed.go.
 func (tlb *TLB) vAddrToSetID(vAddr uint64) (setID int) {
-	// Mix the key into the address before the linear map. With setKey == 0
-	// this reduces exactly to the unkeyed GF(2) hash, so existing behaviour
-	// and the hash unit tests are unchanged.
-	v := vAddr ^ (tlb.setKey << 20)
-
-	idx := 0
-	for r := 0; r < 8; r++ {
-		bit := 0
-		for b := 20 + r; b <= 46; b += 8 {
-			bit ^= int((v >> uint(b)) & 1)
-		}
-		idx |= bit << uint(r)
+	if tlb.defaultMap == nil {
+		tlb.defaultMap = publishedMap()
 	}
-	return idx % tlb.numSets
-}
-
-// Rekey installs a new per-VM set-mapping key. Any translations already
-// resident are left in place but will now be found under different set indices,
-// which is what denies an attacker a stable eviction set across epochs.
-func (tlb *TLB) Rekey(key uint64) {
-	tlb.setKey = key
+	return tlb.defaultMap.index(vAddr) % tlb.numSets
 }
 
 func (tlb *TLB) sendRspToTop(
@@ -244,6 +250,8 @@ func (tlb *TLB) fetchBottom(now sim.VTimeInSec, req *vm.TranslationReq) bool {
 		return false
 	}
 
+	tlb.countWalk(req.PID)
+
 	mshrEntry := tlb.mshr.Add(req.PID, req.VAddr)
 	mshrEntry.Requests = append(mshrEntry.Requests, req)
 	mshrEntry.reqToBottom = fetchBottom
@@ -273,8 +281,15 @@ func (tlb *TLB) parseBottom(now sim.VTimeInSec) bool {
 		return true
 	}
 
-		setID := tlb.vAddrToSetID(page.VAddr)
+	setID := tlb.setIDFor(page.PID, page.VAddr)
 	set := tlb.Sets[setID]
+	if tlb.FillsByPIDSet == nil {
+		tlb.FillsByPIDSet = make(map[vm.PID][]uint64)
+	}
+	if tlb.FillsByPIDSet[page.PID] == nil {
+		tlb.FillsByPIDSet[page.PID] = make([]uint64, tlb.numSets)
+	}
+	tlb.FillsByPIDSet[page.PID][setID]++
 
 	wayID, resident := -1, false
 	if rs, ok := set.(internal.RegionSet); ok {
@@ -352,7 +367,7 @@ func (tlb *TLB) handleTLBFlush(now sim.VTimeInSec, req *FlushReq) bool {
 	}
 
 	for _, vAddr := range req.VAddr {
-		setID := tlb.vAddrToSetID(vAddr)
+		setID := tlb.setIDFor(req.PID, vAddr)
 		set := tlb.Sets[setID]
 		wayID, page, found := set.Lookup(req.PID, vAddr)
 		if !found {

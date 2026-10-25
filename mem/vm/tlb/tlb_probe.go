@@ -50,7 +50,7 @@ func (tlb *TLB) NumWays() int {
 // does not itself disturb the state it is measuring.
 func (tlb *TLB) ProbeResident(es EvictionSet) (resident int) {
 	for _, vAddr := range es.VAddrs {
-		setID := tlb.vAddrToSetID(vAddr)
+		setID := tlb.setIDFor(es.PID, vAddr)
 		set := tlb.Sets[setID]
 
 		if rs, ok := set.(interface {
@@ -88,7 +88,7 @@ func (tlb *TLB) Contention(es EvictionSet) (evicted int) {
 // generates fills that the replacement policy times like any other.
 func (tlb *TLB) Prime(es EvictionSet) {
 	for _, vAddr := range es.VAddrs {
-		setID := tlb.vAddrToSetID(vAddr)
+		setID := tlb.setIDFor(es.PID, vAddr)
 		set := tlb.Sets[setID]
 
 		// Skip if already resident, matching a real prime that only needs to
@@ -144,7 +144,7 @@ func (tlb *TLB) BuildEvictionSet(
 	var vAddr uint64
 
 	for len(es.VAddrs) < ways {
-		if tlb.vAddrToSetID(vAddr) == targetSet {
+		if tlb.setIDFor(pid, vAddr) == targetSet {
 			es.VAddrs = append(es.VAddrs, vAddr)
 		}
 		vAddr += regionStride
@@ -154,4 +154,39 @@ func (tlb *TLB) BuildEvictionSet(
 	}
 
 	return es
+}
+
+// BuildAllEvictionSets builds one eviction set per TLB set for pid, under
+// pid's current mapping, in a single sweep over region-spaced addresses. A
+// keyed mapping scatters candidates over sets at random, so building all sets
+// at once is far cheaper than calling BuildEvictionSet 256 times. It panics if
+// maxCandidates addresses are not enough to fill every set.
+func (tlb *TLB) BuildAllEvictionSets(
+	pid vm.PID,
+	ways int,
+	regionStride uint64,
+	maxCandidates int,
+) []EvictionSet {
+	sets := make([]EvictionSet, tlb.numSets)
+	for s := range sets {
+		sets[s].PID = pid
+	}
+
+	remaining := tlb.numSets
+	vAddr := regionStride // skip address 0
+	for i := 0; remaining > 0 && i < maxCandidates; i++ {
+		s := tlb.setIDFor(pid, vAddr)
+		if len(sets[s].VAddrs) < ways {
+			sets[s].VAddrs = append(sets[s].VAddrs, vAddr)
+			if len(sets[s].VAddrs) == ways {
+				remaining--
+			}
+		}
+		vAddr += regionStride
+	}
+
+	if remaining > 0 {
+		panic("BuildAllEvictionSets: candidate budget too small")
+	}
+	return sets
 }
