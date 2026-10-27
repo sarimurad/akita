@@ -33,6 +33,12 @@ const (
 // setMap is one set-index function: hashOutBits row masks over VA[46:20].
 type setMap struct {
 	rows [hashOutBits]uint64
+	// offset is a key-dependent constant XORed onto the index, making the map
+	// affine rather than linear. Without it, address 0 (and every address in
+	// the first 1 MB region) maps to set 0 under every key, so region 0 is
+	// never scrambled. The offset cancels out of collisions (a and b collide
+	// iff M(a^b) == 0), so it does not change which addresses collide.
+	offset int
 }
 
 // publishedMap is the reference platform's mapping: output bit r is the XOR
@@ -53,7 +59,7 @@ func (m *setMap) index(vAddr uint64) int {
 	for r := 0; r < hashOutBits; r++ {
 		idx |= (bits.OnesCount64(vAddr&m.rows[r]) & 1) << uint(r)
 	}
-	return idx
+	return idx ^ m.offset
 }
 
 // splitmix64 is a small deterministic generator, so a key always yields the
@@ -81,6 +87,7 @@ func keyedMap(key uint64) *setMap {
 			m.rows[r] = splitmix64(&state) & field
 		}
 		if gf2Rank(m.rows[:]) == hashOutBits {
+			m.offset = int(splitmix64(&state) & (1<<hashOutBits - 1))
 			return m
 		}
 	}
